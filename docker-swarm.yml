@@ -1,0 +1,272 @@
+version: '3.9'
+
+x-declare:
+  STACK_NAME: ${STACK_NAME?Variable STACK_NAME is required}
+  VIRTUAL_HOST: ${VIRTUAL_HOST?Variable VIRTUAL_HOST is required}
+  PROBE_URL: ${PROBE_URL?Variable PROBE_URL is required}
+  PROBE_TOKEN: ${PROBE_TOKEN?Variable PROBE_TOKEN is required}
+
+x-app-common: &app-common
+  image: registry.anttek.io/abushka/notification-service/django:${TAG:-latest}
+  environment:
+    DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+    REDIS_URL: redis://redis:6379
+    DJANGO_DEBUG: ${DJANGO_DEBUG:-True}
+    DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-}
+    DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-}
+    JWT_ACCESS_TOKEN_LIFETIME: ${JWT_ACCESS_TOKEN_LIFETIME:-}
+    JWT_REFRESH_TOKEN_LIFETIME: ${JWT_REFRESH_TOKEN_LIFETIME:-}
+    PROBE_URL: ${PROBE_URL}
+    PROBE_TOKEN: ${PROBE_TOKEN}
+    VERSION: ${TAG:-}
+  volumes:
+    - static:/app/static
+    - media:/app/media
+
+services:
+  postgres:
+    image: postgres:15
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      update_config:
+        parallelism: 0
+        delay: 10s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 10s
+        order: stop-first
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-q", "-d", "postgres", "-U", "postgres" ]
+      interval: 5s
+      timeout: 1s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+  redis:
+    image: redis:alpine
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      update_config:
+        parallelism: 0
+        delay: 10s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 10s
+        order: stop-first
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 1s
+      retries: 10
+    volumes:
+      - redis_data:/data
+  django:
+    <<: *app-common
+    deploy:
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 1
+        order: start-first
+        failure_action: continue
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.services.${STACK_NAME}-django.loadbalancer.server.port=8000"
+        - "traefik.http.routers.${STACK_NAME}-django.rule=Host(`${VIRTUAL_HOST}`)"
+        - "traefik.http.routers.${STACK_NAME}-django.entrypoints=https"
+        - "traefik.http.routers.${STACK_NAME}-django.tls=true"
+        - "traefik.docker.network=overlay"
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 5s
+      timeout: 1s
+      retries: 10
+    networks:
+      - default
+      - overlay
+  celery:
+    <<: *app-common
+    command: -A core worker -l info --concurrency 1 -P solo -E
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 5
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 1
+        order: start-first
+        failure_action: continue
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    entrypoint: celery
+    healthcheck:
+      test: [ "CMD-SHELL", "celery", "-A", "core", "status" ]
+      interval: 5s
+      timeout: 1s
+      retries: 10
+  celery-beat:
+    <<: *app-common
+    command: -A core beat -l info
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 5
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 1
+        order: start-first
+        failure_action: continue
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    entrypoint: celery
+    healthcheck:
+      test: [ "CMD-SHELL", "celery", "-A", "core", "status" ]
+      interval: 5s
+      timeout: 1s
+      retries: 10
+  nginx:
+    image: nginx:alpine
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 10
+      update_config:
+        parallelism: 0
+        delay: 10s
+        order: stop-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 0
+        delay: 10s
+        order: stop-first
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.services.${STACK_NAME}-nginx.loadbalancer.server.port=8000"
+        - "traefik.http.routers.${STACK_NAME}-nginx.rule=Host(`${VIRTUAL_HOST}`) && (PathPrefix(`/static/`) || PathPrefix(`/media/`))"
+        - "traefik.http.routers.${STACK_NAME}-nginx.entrypoints=https"
+        - "traefik.http.routers.${STACK_NAME}-nginx.tls=true"
+        - "traefik.docker.network=overlay"
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat <<EOF > /etc/nginx/conf.d/default.conf
+        upstream django {
+            server django:8000;
+        }
+        server {
+            listen 8000;
+
+            location /static/ {
+                alias /usr/share/nginx/html/static/;
+            }
+            location /media/ {
+                alias /usr/share/nginx/html/media/;
+            }
+
+            location /health {
+                access_log off;
+                return 200 "healthy\\n";
+            }
+        }
+        EOF
+        nginx -g "daemon off;"
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -O /dev/null http://localhost:8000/health || exit 1" ]
+      interval: 5s
+      timeout: 1s
+      retries: 10
+    networks:
+      - default
+      - overlay
+    user: root
+    volumes:
+      - static:/usr/share/nginx/html/static:ro
+      - media:/usr/share/nginx/html/media:ro
+
+networks:
+  default:
+    name: ${STACK_NAME}
+  overlay:
+    external: true
+
+volumes:
+  postgres_data:
+    name: ${STACK_NAME}-postgres
+  redis_data:
+    name: ${STACK_NAME}-redis
+  static:
+    name: ${STACK_NAME}-static
+  media:
+    name: ${STACK_NAME}-media

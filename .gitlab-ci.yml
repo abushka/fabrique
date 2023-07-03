@@ -1,0 +1,97 @@
+variables:
+  DJANGO_IMAGE: $CI_REGISTRY_IMAGE/django
+  DOCKER_BUILDKIT: 1
+
+
+image: docker:20.10.16
+services:
+  - name: docker:20.10.16-dind
+    command: ["--experimental"]
+stages:
+  - build
+  - test
+  - release
+  - deploy
+
+
+build:
+  stage: build
+  before_script:
+    - env
+    - docker login -u gitlab-ci-token -p $CI_BUILD_TOKEN $CI_REGISTRY
+    - if ! [ -z "$CI_COMMIT_TAG" ]; then
+        BUILD_TAGS="-t $DJANGO_IMAGE:$CI_COMMIT_SHORT_SHA -t $DJANGO_IMAGE:$CI_COMMIT_TAG -t $DJANGO_IMAGE:latest";
+      else
+        BUILD_TAGS="-t $DJANGO_IMAGE:$CI_COMMIT_SHORT_SHA";
+      fi
+  script:
+    - docker build $BUILD_TAGS .
+    - docker push $DJANGO_IMAGE --all-tags
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "main"'
+      when: always
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_COMMIT_TAG != null'
+      when: always
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_COMMIT_TAG == null'
+      when: never
+
+
+django_tests:
+  stage: test
+  image: $DJANGO_IMAGE:$CI_COMMIT_SHORT_SHA
+  script:
+    - python manage.py test
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "main"'
+      when: always
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_COMMIT_TAG != null'
+      when: always
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_COMMIT_TAG == null'
+      when: never
+
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script: |
+    echo -e "Creating release"
+  release:
+    name: $CI_COMMIT_TAG
+    description: $CI_COMMIT_MESSAGE
+    tag_name: $CI_COMMIT_TAG
+    ref: $CI_COMMIT_TAG
+  rules:
+    - if: $CI_COMMIT_TAG
+
+
+deploy:
+  stage: deploy
+  variables:
+    DOCKER_HOST: tcp://$DOCKER_DEPLOYMENT_HOST:2375
+    DOCKER_TLS_VERIFY: ''
+    STACK_NAME: abushka-broadcasts
+    VIRTUAL_HOST: $DOMAIN
+  before_script:
+    - docker login -u $REGISTRY_USER -p $REGISTRY_PASSWORD $CI_REGISTRY
+  script: |
+    tee .env <<EOF
+    DJANGO_DEBUG=False
+    DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
+    DJANGO_ALLOWED_HOSTS=$VIRTUAL_HOST
+    JWT_ACCESS_TOKEN_LIFETIME=${JWT_ACCESS_TOKEN_LIFETIME:-1440}
+    JWT_REFRESH_TOKEN_LIFETIME=${JWT_REFRESH_TOKEN_LIFETIME:-4320}
+    PROBE_URL=$PROBE_URL
+    PROBE_TOKEN=$PROBE_TOKEN
+    TAG=$CI_COMMIT_TAG
+    STACK_NAME=$STACK_NAME
+    VIRTUAL_HOST=$VIRTUAL_HOST
+    EOF
+    echo -e "$(head -n 1 docker-swarm.yml)\n" > app.yml
+    echo -e "$(docker compose -f docker-swarm.yml config | awk NR\>1)" >> app.yml
+    docker compose -f app.yml pull
+    docker stack deploy -c app.yml $STACK_NAME --with-registry-auth
+  environment:
+    name: production
+    url: https://$VIRTUAL_HOST
+  rules:
+    - if: $CI_COMMIT_TAG

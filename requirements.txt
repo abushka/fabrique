@@ -1,0 +1,27 @@
+# Python
+python-dotenv~=1.0
+pytz~=2023.3
+requests~=2.31
+
+# Django
+Django~=4.2
+djangorestframework~=3.14
+django-filter~=23.2
+djangorestframework-simplejwt~=5.2
+
+# Async tasks
+celery~=5.3
+django-celery-beat~=2.5
+django-celery-results~=2.5
+redis~=4.6
+
+# Database
+psycopg2-binary~=2.9
+dj_database_url~=2.0
+sqlparse~=0.4
+
+# Deployment
+gunicorn~=20.1
+
+# Documentation
+drf-spectacular~=0.26
